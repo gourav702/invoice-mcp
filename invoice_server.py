@@ -28,9 +28,12 @@ Guardrails built in:
 
 import json
 import os
+import smtplib
+import ssl
 import urllib.error
 import urllib.request
 from datetime import datetime
+from email.message import EmailMessage
 
 from mcp.server.fastmcp import FastMCP
 
@@ -53,7 +56,47 @@ def _auth_headers(extra: dict | None = None) -> dict:
 MAX_CREATES_PER_SESSION = 20
 ALLOWED_STATUSES = ("unpaid", "paid", "overdue")
 
+# --- Email settings (for sending payment-request emails) ---
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER")            # e.g. you@gmail.com
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")    # e.g. a Gmail App Password
+FROM_EMAIL = os.environ.get("FROM_EMAIL") or SMTP_USER
+
 _creates_this_session = 0
+
+
+def _email_configured() -> bool:
+    return bool(SMTP_USER and SMTP_PASSWORD)
+
+
+def _looks_like_email(addr: str) -> bool:
+    return "@" in addr and "." in addr.split("@")[-1] and len(addr) >= 5
+
+
+def _send_email(to_addr: str, subject: str, body: str):
+    """Send a plain-text email. Returns (ok, error_message)."""
+    if not _email_configured():
+        return False, ("Email isn't set up on the server yet. The admin needs to set "
+                       "SMTP_USER and SMTP_PASSWORD (e.g. a Gmail address + App Password).")
+    msg = EmailMessage()
+    msg["From"] = FROM_EMAIL or SMTP_USER
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.set_content(body)
+    try:
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as srv:
+                srv.login(SMTP_USER, SMTP_PASSWORD)
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as srv:
+                srv.starttls(context=ssl.create_default_context())
+                srv.login(SMTP_USER, SMTP_PASSWORD)
+                srv.send_message(msg)
+        return True, None
+    except Exception as e:
+        return False, f"Could not send the email: {e}"
 
 mcp = FastMCP("invoices")
 
@@ -146,6 +189,8 @@ def list_invoices(
     item: str | None = None,
     min_amount: float | None = None,
     max_amount: float | None = None,
+    min_qty: int | None = None,
+    max_qty: int | None = None,
 ) -> dict:
     """READ-ONLY. List invoice line-items, with optional filters. Changes nothing.
 
@@ -156,6 +201,8 @@ def list_invoices(
       item        : partial, case-insensitive match on item name
       min_amount  : only rows with unit price >= this number
       max_amount  : only rows with unit price <= this number
+      min_qty     : only rows with quantity >= this number
+      max_qty     : only rows with quantity <= this number
     """
     rows, err = _api_get("/api/invoices")
     if err:
@@ -170,14 +217,20 @@ def list_invoices(
         if item and item.lower() not in (r.get("itemName") or "").lower():
             continue
         price = float(r.get("price") or 0)
+        qty = int(r.get("qty") or 0)
         if min_amount is not None and price < min_amount:
             continue
         if max_amount is not None and price > max_amount:
             continue
+        if min_qty is not None and qty < min_qty:
+            continue
+        if max_qty is not None and qty > max_qty:
+            continue
         out.append(r)
     _log("list_invoices",
          {"status": status, "customer": customer, "item": item,
-          "min_amount": min_amount, "max_amount": max_amount},
+          "min_amount": min_amount, "max_amount": max_amount,
+          "min_qty": min_qty, "max_qty": max_qty},
          "ok", f"{len(out)} matched")
     return {"count": len(out), "invoices": out}
 
@@ -204,20 +257,41 @@ def get_invoice(number: str) -> dict:
 
 
 @mcp.tool()
-def list_items(name: str | None = None) -> dict:
-    """READ-ONLY. List inventory items and their stock levels. Changes nothing.
+def list_items(name: str | None = None,
+               min_qty: int | None = None, max_qty: int | None = None,
+               min_price: float | None = None, max_price: float | None = None) -> dict:
+    """READ-ONLY. List inventory items and their stock levels, with optional filters.
 
-    Optional 'name' does a partial, case-insensitive match. Use this to see what
-    can be sold (and how much stock is left) before creating an invoice.
+    Filters (all optional, combine freely):
+      name       : partial, case-insensitive match on item name
+      min_qty    : only items with stock >= this number (e.g. min_qty=1 = in stock)
+      max_qty    : only items with stock <= this number (e.g. max_qty=0 = out of stock)
+      min_price  : only items priced >= this
+      max_price  : only items priced <= this
     """
     items, err = _api_get("/api/items")
     if err:
         _log("list_items", {"name": name}, "error", err)
         return {"error": err}
-    if name:
-        items = [i for i in items if name.lower() in (i.get("name") or "").lower()]
-    _log("list_items", {"name": name}, "ok", f"{len(items)} matched")
-    return {"count": len(items), "items": items}
+    out = []
+    for i in items:
+        if name and name.lower() not in (i.get("name") or "").lower():
+            continue
+        qty = int(i.get("qty") or 0)
+        price = float(i.get("price") or 0)
+        if min_qty is not None and qty < min_qty:
+            continue
+        if max_qty is not None and qty > max_qty:
+            continue
+        if min_price is not None and price < min_price:
+            continue
+        if max_price is not None and price > max_price:
+            continue
+        out.append(i)
+    _log("list_items", {"name": name, "min_qty": min_qty, "max_qty": max_qty,
+                        "min_price": min_price, "max_price": max_price},
+         "ok", f"{len(out)} matched")
+    return {"count": len(out), "items": out}
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +562,57 @@ def update_invoice(number: str, customer_name: str | None = None,
         return {"error": err}
     _log("update_invoice", inputs, "ok")
     return {"message": "Invoice updated.", "invoice": result}
+
+
+@mcp.tool()
+def send_invoice_email(number: str, to_email: str | None = None,
+                       message: str | None = None) -> dict:
+    """SENDS AN EMAIL — emails a payment request to the customer for an invoice.
+
+    Looks up the invoice by number, works out the total amount due, and emails the
+    customer. By default the body says "Please pay this <amount>", but you can pass
+    your own message.
+
+    Required:
+      number   : the invoice number to send (must match exactly one invoice)
+    Optional:
+      to_email : recipient; defaults to the invoice's saved customer email
+      message  : custom message text; defaults to "Please pay this <amount>."
+    """
+    inputs = {"number": number, "to_email": to_email}
+    if not number or not str(number).strip():
+        return {"error": "An invoice number is required."}
+    rows, err = _api_get("/api/invoices")
+    if err:
+        _log("send_invoice_email", inputs, "error", err)
+        return {"error": err}
+    matches = [r for r in rows if str(r.get("number", "")) == str(number)]
+    if not matches:
+        _log("send_invoice_email", inputs, "not_found")
+        return {"error": f"No invoice found with number '{number}'."}
+
+    total = sum(float(r.get("price") or 0) * int(r.get("qty") or 0) for r in matches)
+    recipient = (to_email or matches[0].get("customerEmail") or "").strip()
+    if not recipient:
+        _log("send_invoice_email", inputs, "rejected", "no recipient")
+        return {"error": f"Invoice {number} has no customer email saved. "
+                         f"Provide to_email, or add the customer's email to the invoice."}
+    if not _looks_like_email(recipient):
+        return {"error": f"'{recipient}' doesn't look like a valid email address."}
+
+    body_line = message.strip() if message else f"Please pay this {total}."
+    items_str = ", ".join(f"{r['qty']} x {r['itemName']}" for r in matches)
+    full_body = (f"{body_line}\n\n"
+                 f"Invoice number: {number}\n"
+                 f"Items: {items_str}\n"
+                 f"Amount due: {total}\n")
+    ok, send_err = _send_email(recipient, f"Invoice {number} — payment request", full_body)
+    if not ok:
+        _log("send_invoice_email", inputs, "error", send_err)
+        return {"error": send_err}
+    _log("send_invoice_email", inputs, "ok", f"{recipient} / {total}")
+    return {"message": f"Payment-request email sent to {recipient}.",
+            "invoice": number, "amount_due": total}
 
 
 if __name__ == "__main__":
