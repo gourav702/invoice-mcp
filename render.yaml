@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: invoice-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python invoice_server.py
+    envVars:
+      # Run as a remote HTTPS service (not local stdio).
+      - key: MCP_TRANSPORT
+        value: http
+      # The public URL of your deployed accounting app, e.g.
+      # https://accounting-software-xxxx.onrender.com  (no trailing slash)
+      - key: INVOICE_API_BASE
+        sync: false
+      # Must match the accounting app's API_SECRET.
+      - key: INVOICE_API_SECRET
+        sync: false
