@@ -106,6 +106,26 @@ def _api_post(path: str, payload: dict):
         return None, f"Unexpected error writing to the app: {e}"
 
 
+def _api_put(path: str, payload: dict):
+    """PUT JSON to the app. Returns (data, None) or (None, friendly_error)."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(API_BASE + path, data=data, method="PUT",
+                                 headers=_auth_headers({"Content-Type": "application/json"}))
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8")), None
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
+        except Exception:
+            msg = str(e)
+        return None, msg
+    except urllib.error.URLError as e:
+        return None, (f"Could not reach your accounting app at {API_BASE}. Is it running?  [{e}]")
+    except Exception as e:
+        return None, f"Unexpected error writing to the app: {e}"
+
+
 def _valid_date(text: str) -> bool:
     if not text:
         return True  # due_date is optional
@@ -217,6 +237,15 @@ def create_invoice(
 ) -> dict:
     """WRITES — creates a new invoice line-item and DECREMENTS that item's stock.
 
+    You can call this in two ways:
+      1) The user gives the details in chat, or
+      2) The user UPLOADS an invoice (PDF/image/scan) — read the document, extract
+         the fields below, and call this tool with them.
+
+    IMPORTANT: If any REQUIRED field (number, item_name, qty) is missing or you are
+    not confident you read it correctly from an uploaded document, ASK the user to
+    confirm or provide it instead of guessing. Do not invent values.
+
     Your accounting app performs the stock check and decrement, so this can fail
     if there isn't enough stock (you'll get a clear message).
 
@@ -320,6 +349,145 @@ def create_invoice(
         "invoice": result.get("invoice"),
         "item_after": result.get("item"),
     }
+
+
+@mcp.tool()
+def create_item(name: str, qty: int, price: float) -> dict:
+    """WRITES — adds a NEW inventory item (so it can be sold on invoices).
+
+    Required:
+      name  : item name (non-empty)
+      qty   : starting stock, a whole number >= 0
+      price : catalogue unit price, a number >= 0
+    Returns the created item including its new id.
+    """
+    global _creates_this_session
+    inputs = {"name": name, "qty": qty, "price": price}
+    if not name or not str(name).strip():
+        _log("create_item", inputs, "rejected", "empty name")
+        return {"error": "Item name must not be empty."}
+    try:
+        qty = int(qty)
+    except (ValueError, TypeError):
+        return {"error": "qty must be a whole number."}
+    if qty < 0:
+        return {"error": "qty cannot be negative."}
+    try:
+        price = float(price)
+    except (ValueError, TypeError):
+        return {"error": "price must be a number."}
+    if price < 0:
+        return {"error": "price cannot be negative."}
+    if _creates_this_session >= MAX_CREATES_PER_SESSION:
+        return {"error": f"Safety cap reached: at most {MAX_CREATES_PER_SESSION} "
+                         f"creations per session. Restart the server to reset."}
+    result, err = _api_post("/api/items", {"name": name.strip(), "qty": qty, "price": price})
+    if err:
+        _log("create_item", inputs, "error", err)
+        return {"error": err}
+    _creates_this_session += 1
+    _log("create_item", inputs, "ok", result.get("name"))
+    return {"message": "Item created.", "item": result}
+
+
+@mcp.tool()
+def update_item(item_id: int, name: str | None = None,
+                qty: int | None = None, price: float | None = None) -> dict:
+    """WRITES — updates an existing inventory item's name, stock, and/or price.
+
+    Required:
+      item_id : the id of the item to change (see list_items)
+    Optional (give at least one):
+      name  : new name (non-empty)
+      qty   : new stock level, a whole number >= 0
+      price : new unit price, a number >= 0
+    Only the fields you provide are changed.
+    """
+    inputs = {"item_id": item_id, "name": name, "qty": qty, "price": price}
+    try:
+        item_id = int(item_id)
+    except (ValueError, TypeError):
+        return {"error": "item_id must be a whole number."}
+    payload: dict = {"id": item_id}
+    if name is not None:
+        if not str(name).strip():
+            return {"error": "name cannot be empty."}
+        payload["name"] = str(name).strip()
+    if qty is not None:
+        try:
+            payload["qty"] = int(qty)
+        except (ValueError, TypeError):
+            return {"error": "qty must be a whole number."}
+        if payload["qty"] < 0:
+            return {"error": "qty cannot be negative."}
+    if price is not None:
+        try:
+            payload["price"] = float(price)
+        except (ValueError, TypeError):
+            return {"error": "price must be a number."}
+        if payload["price"] < 0:
+            return {"error": "price cannot be negative."}
+    if len(payload) == 1:
+        return {"error": "Nothing to update — provide a new name, qty, and/or price."}
+    result, err = _api_put("/api/items", payload)
+    if err:
+        _log("update_item", inputs, "error", err)
+        return {"error": err}
+    _log("update_item", inputs, "ok")
+    return {"message": "Item updated.", "item": result}
+
+
+@mcp.tool()
+def update_invoice(number: str, customer_name: str | None = None,
+                   customer_email: str | None = None, due_date: str | None = None,
+                   status: str | None = None, notes: str | None = None,
+                   price: float | None = None) -> dict:
+    """WRITES — updates an existing invoice's details (found by its number).
+
+    NOTE: this changes invoice DETAILS only — not the item or quantity — so stock
+    stays correct. The invoice number must match exactly one invoice.
+
+    Required:
+      number : the invoice number to update (e.g. INV-1001)
+    Optional (give at least one):
+      customer_name, customer_email, notes
+      due_date : YYYY-MM-DD
+      status   : unpaid / paid / overdue
+      price    : unit price, a number >= 0
+    """
+    inputs = {"number": number, "status": status}
+    if not number or not str(number).strip():
+        return {"error": "An invoice number is required."}
+    payload: dict = {"number": str(number).strip()}
+    if customer_name is not None:
+        payload["customerName"] = str(customer_name).strip()
+    if customer_email is not None:
+        payload["customerEmail"] = str(customer_email).strip()
+    if notes is not None:
+        payload["notes"] = str(notes).strip()
+    if due_date is not None:
+        if not _valid_date(due_date):
+            return {"error": "due_date must be a valid date in YYYY-MM-DD format."}
+        payload["dueDate"] = due_date
+    if status is not None:
+        if status not in ALLOWED_STATUSES:
+            return {"error": f"status must be one of {list(ALLOWED_STATUSES)}."}
+        payload["status"] = status
+    if price is not None:
+        try:
+            payload["price"] = float(price)
+        except (ValueError, TypeError):
+            return {"error": "price must be a number."}
+        if payload["price"] < 0:
+            return {"error": "price cannot be negative."}
+    if len(payload) == 1:
+        return {"error": "Nothing to update — provide at least one field to change."}
+    result, err = _api_put("/api/invoices", payload)
+    if err:
+        _log("update_invoice", inputs, "error", err)
+        return {"error": err}
+    _log("update_invoice", inputs, "ok")
+    return {"message": "Invoice updated.", "invoice": result}
 
 
 if __name__ == "__main__":
