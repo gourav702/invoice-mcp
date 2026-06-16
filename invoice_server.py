@@ -327,8 +327,14 @@ if __name__ == "__main__":
     # MCP_TRANSPORT=http to expose an HTTPS endpoint other machines can reach.
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport == "http":
+        from mcp.server.transport_security import TransportSecuritySettings
         mcp.settings.host = os.environ.get("HOST", "0.0.0.0")
         mcp.settings.port = int(os.environ.get("PORT", "8000"))
+        # Hosted behind a proxy (Render): the public hostname isn't localhost,
+        # so turn off the localhost-only DNS-rebinding guard. Writes are still
+        # protected by the API secret between this server and the app.
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False)
         mcp.run(transport="streamable-http")
     else:
         mcp.run()
