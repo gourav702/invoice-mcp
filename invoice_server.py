@@ -58,30 +58,49 @@ MAX_CREATES_PER_SESSION = 20
 ALLOWED_STATUSES = ("unpaid", "paid", "overdue")
 
 # --- Email settings (for sending payment-request emails) ---
+# Preferred: Resend (HTTP API over port 443 — works on hosts that block SMTP).
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+# Fallback: SMTP (works locally; blocked on most cloud hosts like Render).
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER")            # e.g. you@gmail.com
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")    # e.g. a Gmail App Password
-FROM_EMAIL = os.environ.get("FROM_EMAIL") or SMTP_USER
+SMTP_USER = os.environ.get("SMTP_USER")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+# The "From" address. For Resend, use a verified domain or "onboarding@resend.dev".
+FROM_EMAIL = os.environ.get("FROM_EMAIL") or SMTP_USER or "onboarding@resend.dev"
 
 _creates_this_session = 0
 
 
 def _email_configured() -> bool:
-    return bool(SMTP_USER and SMTP_PASSWORD)
+    return bool(RESEND_API_KEY) or bool(SMTP_USER and SMTP_PASSWORD)
 
 
 def _looks_like_email(addr: str) -> bool:
     return "@" in addr and "." in addr.split("@")[-1] and len(addr) >= 5
 
 
-def _send_email(to_addr: str, subject: str, body: str):
-    """Send a plain-text email. Returns (ok, error_message)."""
-    if not _email_configured():
-        return False, ("Email isn't set up on the server yet. The admin needs to set "
-                       "SMTP_USER and SMTP_PASSWORD (e.g. a Gmail address + App Password).")
+def _send_via_resend(to_addr: str, subject: str, body: str):
+    payload = {"from": FROM_EMAIL, "to": [to_addr], "subject": subject, "text": body}
+    req = urllib.request.Request(
+        "https://api.resend.com/emails", data=json.dumps(payload).encode(), method="POST",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            resp.read()
+        return True, None
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode()).get("message", str(e))
+        except Exception:
+            detail = str(e)
+        return False, f"Email service rejected the request: {detail}"
+    except Exception as e:
+        return False, f"Could not send the email: {e}"
+
+
+def _send_via_smtp(to_addr: str, subject: str, body: str):
     msg = EmailMessage()
-    msg["From"] = FROM_EMAIL or SMTP_USER
+    msg["From"] = FROM_EMAIL
     msg["To"] = to_addr
     msg["Subject"] = subject
     msg.set_content(body)
@@ -98,6 +117,16 @@ def _send_email(to_addr: str, subject: str, body: str):
         return True, None
     except Exception as e:
         return False, f"Could not send the email: {e}"
+
+
+def _send_email(to_addr: str, subject: str, body: str):
+    """Send a plain-text email via Resend (preferred) or SMTP. Returns (ok, error)."""
+    if RESEND_API_KEY:
+        return _send_via_resend(to_addr, subject, body)
+    if SMTP_USER and SMTP_PASSWORD:
+        return _send_via_smtp(to_addr, subject, body)
+    return False, ("Email isn't set up on the server yet. Set RESEND_API_KEY "
+                   "(recommended for cloud hosting) on the server.")
 
 mcp = FastMCP("invoices")
 
