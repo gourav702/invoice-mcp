@@ -90,10 +90,16 @@ def _send_via_resend(to_addr: str, subject: str, body: str):
         return True, None
     except urllib.error.HTTPError as e:
         try:
-            detail = json.loads(e.read().decode()).get("message", str(e))
+            raw = e.read().decode()
         except Exception:
-            detail = str(e)
-        return False, f"Email service rejected the request: {detail}"
+            raw = ""
+        detail = raw or str(e)
+        try:
+            j = json.loads(raw)
+            detail = j.get("message") or j.get("error") or raw
+        except Exception:
+            pass
+        return False, f"Email service rejected the request ({e.code}): {detail}"
     except Exception as e:
         return False, f"Could not send the email: {e}"
 
