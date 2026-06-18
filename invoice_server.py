@@ -31,6 +31,7 @@ import os
 import smtplib
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from email.message import EmailMessage
@@ -167,6 +168,24 @@ def _api_put(path: str, payload: dict):
         return None, (f"Could not reach your accounting app at {API_BASE}. Is it running?  [{e}]")
     except Exception as e:
         return None, f"Unexpected error writing to the app: {e}"
+
+
+def _api_delete(path: str):
+    """DELETE request to the app. Returns (data, None) or (None, friendly_error)."""
+    req = urllib.request.Request(API_BASE + path, method="DELETE", headers=_auth_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8")), None
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
+        except Exception:
+            msg = str(e)
+        return None, msg
+    except urllib.error.URLError as e:
+        return None, (f"Could not reach your accounting app at {API_BASE}. Is it running?  [{e}]")
+    except Exception as e:
+        return None, f"Unexpected error deleting from the app: {e}"
 
 
 def _valid_date(text: str) -> bool:
@@ -613,6 +632,66 @@ def send_invoice_email(number: str, to_email: str | None = None,
     _log("send_invoice_email", inputs, "ok", f"{recipient} / {total}")
     return {"message": f"Payment-request email sent to {recipient}.",
             "invoice": number, "amount_due": total}
+
+
+@mcp.tool()
+def delete_invoice(number: str, restore_stock: bool = True) -> dict:
+    """WRITES / DESTRUCTIVE — permanently deletes an invoice (cancels it).
+
+    SAFETY: only deletes when the invoice number matches EXACTLY ONE invoice. If a
+    number is shared by several rows, it refuses (so it can never mass-delete).
+
+    By default the sold units are RETURNED to stock (restore_stock=True), treating
+    the deletion as a cancellation. Set restore_stock=False to delete without
+    changing stock.
+
+    Required:
+      number        : the invoice number to delete (must be unique)
+    Optional:
+      restore_stock : add the sold quantity back to the item's stock (default True)
+    """
+    inputs = {"number": number, "restore_stock": restore_stock}
+    if not number or not str(number).strip():
+        return {"error": "An invoice number is required."}
+    number = str(number).strip()
+
+    rows, err = _api_get("/api/invoices")
+    if err:
+        _log("delete_invoice", inputs, "error", err)
+        return {"error": err}
+    matches = [r for r in rows if str(r.get("number", "")) == number]
+    if not matches:
+        _log("delete_invoice", inputs, "not_found")
+        return {"error": f"No invoice found with number '{number}'."}
+    if len(matches) > 1:
+        _log("delete_invoice", inputs, "rejected", "ambiguous")
+        return {"error": f"{len(matches)} invoices share number '{number}'. For safety "
+                         f"this tool only deletes when the number is unique."}
+
+    inv = matches[0]
+    # Delete the single matching invoice.
+    result, err = _api_delete(f"/api/invoices?number={urllib.parse.quote(number)}")
+    if err:
+        _log("delete_invoice", inputs, "error", err)
+        return {"error": err}
+
+    # Optionally return the sold units to stock.
+    restored = None
+    if restore_stock:
+        items, ierr = _api_get("/api/items")
+        if not ierr:
+            it = next((i for i in items
+                       if (i.get("name") or "").lower() == (inv.get("itemName") or "").lower()), None)
+            if it:
+                new_qty = int(it.get("qty") or 0) + int(inv.get("qty") or 0)
+                _, perr = _api_put("/api/items", {"id": it["id"], "qty": new_qty})
+                if not perr:
+                    restored = {"item": it["name"], "added_back": inv.get("qty"), "new_qty": new_qty}
+
+    _log("delete_invoice", inputs, "ok", f"deleted {number}; restored={bool(restored)}")
+    return {"message": f"Invoice {number} deleted.",
+            "deleted_invoice": inv,
+            "stock_restored": restored}
 
 
 if __name__ == "__main__":
