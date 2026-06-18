@@ -83,7 +83,11 @@ def _send_via_resend(to_addr: str, subject: str, body: str):
     payload = {"from": FROM_EMAIL, "to": [to_addr], "subject": subject, "text": body}
     req = urllib.request.Request(
         "https://api.resend.com/emails", data=json.dumps(payload).encode(), method="POST",
-        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"})
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                 "Content-Type": "application/json",
+                 # A real User-Agent avoids Cloudflare's bot block (error 1010).
+                 "User-Agent": "invoice-mcp/1.0 (+https://invoice-mcp.onrender.com)",
+                 "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             resp.read()
